@@ -1,6 +1,7 @@
 #include <windows.h>
 #include <intrin.h>
 #include <winver.h>
+#include <stdlib.h>
 #include "beacon.h"
 
 typedef struct _UNICODE_STRING {
@@ -125,6 +126,27 @@ static void format_size(char *out, int out_len, unsigned int bytes)
     }
 }
 
+static int __cdecl compare_modules(const void *a, const void *b)
+{
+    const PLDR_DATA_TABLE_ENTRY left = *(const PLDR_DATA_TABLE_ENTRY *)a;
+    const PLDR_DATA_TABLE_ENTRY right = *(const PLDR_DATA_TABLE_ENTRY *)b;
+    int result = CompareStringW(
+        LOCALE_INVARIANT,
+        NORM_IGNORECASE,
+        left->BaseDllName.Buffer,
+        left->BaseDllName.Length / sizeof(WCHAR),
+        right->BaseDllName.Buffer,
+        right->BaseDllName.Length / sizeof(WCHAR));
+
+    if (result == CSTR_LESS_THAN) {
+        return -1;
+    }
+    if (result == CSTR_GREATER_THAN) {
+        return 1;
+    }
+    return 0;
+}
+
 void go(char* args, int length)
 {
     formatp format;
@@ -143,6 +165,7 @@ void go(char* args, int length)
         int size_width = 7;
         LIST_ENTRY *head = &peb->Ldr->InLoadOrderModuleList;
         LIST_ENTRY *entry = head->Flink;
+        int module_count = 0;
         BeaconFormatPrintf(&format, "Loaded modules:\n");
 
         while (entry && entry != head) {
@@ -172,6 +195,7 @@ void go(char* args, int length)
                 size_width = size_len;
             }
 
+            module_count++;
             entry = entry->Flink;
         }
 
@@ -210,43 +234,98 @@ void go(char* args, int length)
         format_repeat(&format, '-', max_desc + 2);
         BeaconFormatPrintf(&format, "+\n");
 
-        entry = head->Flink;
-        while (entry && entry != head) {
-            PLDR_DATA_TABLE_ENTRY module = (PLDR_DATA_TABLE_ENTRY)entry;
-            int wide_len = module->BaseDllName.Length / sizeof(WCHAR);
-            char name[MAX_PATH];
-            char description[256];
-            char size_text[32];
-            int converted = WideCharToMultiByte(
-                CP_ACP, 0, module->BaseDllName.Buffer, wide_len,
-                name, (int)sizeof(name) - 1, NULL, NULL);
+        if (module_count > 0) {
+            PLDR_DATA_TABLE_ENTRY *modules = (PLDR_DATA_TABLE_ENTRY *)HeapAlloc(
+                GetProcessHeap(), 0, module_count * sizeof(PLDR_DATA_TABLE_ENTRY));
+            int idx = 0;
 
-            if (converted <= 0) {
-                lstrcpynA(name, "<unknown>", (int)sizeof(name));
-            } else {
-                name[converted] = '\0';
+            entry = head->Flink;
+            while (entry && entry != head && idx < module_count) {
+                modules[idx++] = (PLDR_DATA_TABLE_ENTRY)entry;
+                entry = entry->Flink;
             }
 
-            get_module_description(module->FullDllName.Buffer, description, (int)sizeof(description));
-            if (description[0] == '\0') {
-                lstrcpynA(description, "-", (int)sizeof(description));
-            }
+            if (modules) {
+                qsort(modules, module_count, sizeof(PLDR_DATA_TABLE_ENTRY), compare_modules);
 
-            format_size(size_text, (int)sizeof(size_text), (unsigned int)module->SizeOfImage);
+                for (idx = 0; idx < module_count; idx++) {
+                    PLDR_DATA_TABLE_ENTRY module = modules[idx];
+                    int wide_len = module->BaseDllName.Length / sizeof(WCHAR);
+                    char name[MAX_PATH];
+                    char description[256];
+                    char size_text[32];
+                    int converted = WideCharToMultiByte(
+                        CP_ACP, 0, module->BaseDllName.Buffer, wide_len,
+                        name, (int)sizeof(name) - 1, NULL, NULL);
 
-            BeaconFormatPrintf(
-                &format,
-                "| %-*.*s | 0x%0*I64X | %-*.*s | %-*.*s |\n",
-                max_name, max_name, name,
-                base_width - 2,
+                    if (converted <= 0) {
+                        lstrcpynA(name, "<unknown>", (int)sizeof(name));
+                    } else {
+                        name[converted] = '\0';
+                    }
+
+                    get_module_description(module->FullDllName.Buffer, description, (int)sizeof(description));
+                    if (description[0] == '\0') {
+                        lstrcpynA(description, "-", (int)sizeof(description));
+                    }
+
+                    format_size(size_text, (int)sizeof(size_text), (unsigned int)module->SizeOfImage);
+
+                    BeaconFormatPrintf(
+                        &format,
+                        "| %-*.*s | 0x%0*I64X | %-*.*s | %-*.*s |\n",
+                        max_name, max_name, name,
+                        base_width - 2,
 #if defined(_M_X64)
-                (unsigned long long)module->DllBase,
+                        (unsigned long long)module->DllBase,
 #else
-                (unsigned long long)(ULONG_PTR)module->DllBase,
+                        (unsigned long long)(ULONG_PTR)module->DllBase,
 #endif
-                size_width, size_width, size_text,
-                max_desc, max_desc, description);
-            entry = entry->Flink;
+                        size_width, size_width, size_text,
+                        max_desc, max_desc, description);
+                }
+
+                HeapFree(GetProcessHeap(), 0, modules);
+            } else {
+                entry = head->Flink;
+                while (entry && entry != head) {
+                    PLDR_DATA_TABLE_ENTRY module = (PLDR_DATA_TABLE_ENTRY)entry;
+                    int wide_len = module->BaseDllName.Length / sizeof(WCHAR);
+                    char name[MAX_PATH];
+                    char description[256];
+                    char size_text[32];
+                    int converted = WideCharToMultiByte(
+                        CP_ACP, 0, module->BaseDllName.Buffer, wide_len,
+                        name, (int)sizeof(name) - 1, NULL, NULL);
+
+                    if (converted <= 0) {
+                        lstrcpynA(name, "<unknown>", (int)sizeof(name));
+                    } else {
+                        name[converted] = '\0';
+                    }
+
+                    get_module_description(module->FullDllName.Buffer, description, (int)sizeof(description));
+                    if (description[0] == '\0') {
+                        lstrcpynA(description, "-", (int)sizeof(description));
+                    }
+
+                    format_size(size_text, (int)sizeof(size_text), (unsigned int)module->SizeOfImage);
+
+                    BeaconFormatPrintf(
+                        &format,
+                        "| %-*.*s | 0x%0*I64X | %-*.*s | %-*.*s |\n",
+                        max_name, max_name, name,
+                        base_width - 2,
+#if defined(_M_X64)
+                        (unsigned long long)module->DllBase,
+#else
+                        (unsigned long long)(ULONG_PTR)module->DllBase,
+#endif
+                        size_width, size_width, size_text,
+                        max_desc, max_desc, description);
+                    entry = entry->Flink;
+                }
+            }
         }
 
         BeaconFormatPrintf(&format, "+");
